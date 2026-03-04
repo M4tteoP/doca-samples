@@ -214,7 +214,10 @@ doca_error_t create_acl_pipe(struct doca_flow_port *port, bool is_root, struct d
 
 	monitor_counter.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
 
-	fwd_miss.type = DOCA_FLOW_FWD_DROP;
+	/* Miss policy: allow all traffic by default (forward to the other port).
+	 * Only explicitly denied entries (e.g. TCP dst port 8443) will be dropped. */
+	fwd_miss.type = DOCA_FLOW_FWD_PORT;
+	fwd_miss.port_id = 0; /* overridden per-entry, but needed for pipe creation */
 
 	result = doca_flow_pipe_cfg_create(&pipe_cfg, port);
 	if (result != DOCA_SUCCESS) {
@@ -373,6 +376,30 @@ doca_error_t add_acl_specific_entry(struct doca_flow_pipe *pipe,
  * @entries [out]: array of pointers to created entries
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise.
  */
+/*
+ * TO CUSTOMIZE ACL RULES: modify the entries below.
+ * Each add_acl_specific_entry() call defines one ACL rule with these parameters:
+ *
+ *   add_acl_specific_entry(pipe, port_id, status,
+ *       src_ip,          <-- source IP:       BE_IPV4_ADDR(a, b, c, d)
+ *       dst_ip,          <-- destination IP:   BE_IPV4_ADDR(a, b, c, d)
+ *       src_port,        <-- source port:      DOCA_HTOBE16(port)
+ *       dst_port,        <-- destination port:  DOCA_HTOBE16(port)
+ *       l4_type,         <-- protocol:         DOCA_FLOW_L4_TYPE_EXT_TCP or _UDP
+ *       src_ip_mask,     <-- src IP mask:      0xffffffff = exact, 0xffffff00 = /24, etc.
+ *       dst_ip_mask,     <-- dst IP mask:      same as above
+ *       src_port_mask,   <-- 0x0 = any port, same as src_port = exact, > src_port = range [src_port, mask]
+ *       dst_port_mask,   <-- 0x0 = any port, same as dst_port = exact, > dst_port = range [dst_port, mask]
+ *       priority,        <-- 0-1024, lower value = higher priority
+ *       is_allow,        <-- true = forward, false = drop
+ *       flag,            <-- DOCA_FLOW_WAIT_FOR_BATCH or DOCA_FLOW_NO_WAIT (use NO_WAIT on last entry)
+ *       &entry)
+ *
+ * When adding/removing entries, update num_of_entries in flow_acl() accordingly
+ * (num_of_entries = 1 for main pipe + number of ACL entries).
+ * Packets not matching any entry hit the miss policy (DROP).
+ */
+ // Currently unused in flow_acl()
 doca_error_t add_acl_pipe_entries(struct doca_flow_pipe *pipe,
 				  int port_id,
 				  struct entries_status *status,
@@ -381,79 +408,83 @@ doca_error_t add_acl_pipe_entries(struct doca_flow_pipe *pipe,
 	doca_error_t result;
 	int i_entry = 0;
 
+	/* DENY TCP from 1.2.3.4 -> 8.8.8.8, exact IPs, any ports, priority 10 */
 	result = add_acl_specific_entry(pipe,
 					port_id,
 					status,
-					BE_IPV4_ADDR(1, 2, 3, 4),
-					BE_IPV4_ADDR(8, 8, 8, 8),
-					DOCA_HTOBE16(1234),
-					DOCA_HTOBE16(80),
-					DOCA_FLOW_L4_TYPE_EXT_TCP,
-					DOCA_HTOBE32(0xffffffff),
-					DOCA_HTOBE32(0xffffffff),
-					DOCA_HTOBE16(0x00),
-					DOCA_HTOBE16(0x0),
-					10,
-					false,
+					BE_IPV4_ADDR(1, 2, 3, 4),       /* src_ip */
+					BE_IPV4_ADDR(8, 8, 8, 8),       /* dst_ip */
+					DOCA_HTOBE16(1234),              /* src_port */
+					DOCA_HTOBE16(80),                /* dst_port */
+					DOCA_FLOW_L4_TYPE_EXT_TCP,       /* protocol */
+					DOCA_HTOBE32(0xffffffff),        /* src_ip_mask: exact */
+					DOCA_HTOBE32(0xffffffff),        /* dst_ip_mask: exact */
+					DOCA_HTOBE16(0x00),              /* src_port_mask: any */
+					DOCA_HTOBE16(0x0),               /* dst_port_mask: any */
+					10,                              /* priority */
+					false,                           /* is_allow: DENY */
 					DOCA_FLOW_WAIT_FOR_BATCH,
 					&entries[i_entry++]);
 	if (result != DOCA_SUCCESS)
 		return result;
 
+	/* ALLOW UDP from 172.20.1.4 -> 192.168.3.4, exact IPs, any src port, dst port range [80, 3000] */
 	result = add_acl_specific_entry(pipe,
 					port_id,
 					status,
-					BE_IPV4_ADDR(172, 20, 1, 4),
-					BE_IPV4_ADDR(192, 168, 3, 4),
-					DOCA_HTOBE16(1234),
-					DOCA_HTOBE16(80),
-					DOCA_FLOW_L4_TYPE_EXT_UDP,
-					DOCA_HTOBE32(0xffffffff),
-					DOCA_HTOBE32(0xffffffff),
-					DOCA_HTOBE16(0x0),
-					DOCA_HTOBE16(3000),
-					50,
-					true,
-					DOCA_FLOW_WAIT_FOR_BATCH,
-					&entries[i_entry++]);
-
-	if (result != DOCA_SUCCESS)
-		return result;
-
-	result = add_acl_specific_entry(pipe,
-					port_id,
-					status,
-					BE_IPV4_ADDR(172, 20, 1, 4),
-					BE_IPV4_ADDR(192, 168, 3, 4),
-					DOCA_HTOBE16(1234),
-					DOCA_HTOBE16(80),
-					DOCA_FLOW_L4_TYPE_EXT_TCP,
-					DOCA_HTOBE32(0xffffffff),
-					DOCA_HTOBE32(0xffffffff),
-					DOCA_HTOBE16(1234),
-					DOCA_HTOBE16(0x0),
-					40,
-					true,
+					BE_IPV4_ADDR(172, 20, 1, 4),    /* src_ip */
+					BE_IPV4_ADDR(192, 168, 3, 4),   /* dst_ip */
+					DOCA_HTOBE16(1234),              /* src_port */
+					DOCA_HTOBE16(80),                /* dst_port */
+					DOCA_FLOW_L4_TYPE_EXT_UDP,       /* protocol */
+					DOCA_HTOBE32(0xffffffff),        /* src_ip_mask: exact */
+					DOCA_HTOBE32(0xffffffff),        /* dst_ip_mask: exact */
+					DOCA_HTOBE16(0x0),               /* src_port_mask: any */
+					DOCA_HTOBE16(3000),              /* dst_port_mask: range [80, 3000] */
+					50,                              /* priority */
+					true,                            /* is_allow: ALLOW */
 					DOCA_FLOW_WAIT_FOR_BATCH,
 					&entries[i_entry++]);
 
 	if (result != DOCA_SUCCESS)
 		return result;
 
+	/* ALLOW TCP from 172.20.1.4 -> 192.168.3.4, exact IPs, exact src port 1234, any dst port */
 	result = add_acl_specific_entry(pipe,
 					port_id,
 					status,
-					BE_IPV4_ADDR(1, 2, 3, 5),
-					BE_IPV4_ADDR(8, 8, 8, 6),
-					DOCA_HTOBE16(1234),
-					DOCA_HTOBE16(80),
-					DOCA_FLOW_L4_TYPE_EXT_TCP,
-					DOCA_HTOBE32(0xffffff00),
-					DOCA_HTOBE32(0xffffff00),
-					DOCA_HTOBE16(0xffff),
-					DOCA_HTOBE16(80),
-					20,
-					true,
+					BE_IPV4_ADDR(172, 20, 1, 4),    /* src_ip */
+					BE_IPV4_ADDR(192, 168, 3, 4),   /* dst_ip */
+					DOCA_HTOBE16(1234),              /* src_port */
+					DOCA_HTOBE16(80),                /* dst_port */
+					DOCA_FLOW_L4_TYPE_EXT_TCP,       /* protocol */
+					DOCA_HTOBE32(0xffffffff),        /* src_ip_mask: exact */
+					DOCA_HTOBE32(0xffffffff),        /* dst_ip_mask: exact */
+					DOCA_HTOBE16(1234),              /* src_port_mask: exact (== src_port) */
+					DOCA_HTOBE16(0x0),               /* dst_port_mask: any */
+					40,                              /* priority */
+					true,                            /* is_allow: ALLOW */
+					DOCA_FLOW_WAIT_FOR_BATCH,
+					&entries[i_entry++]);
+
+	if (result != DOCA_SUCCESS)
+		return result;
+
+	/* ALLOW TCP from 1.2.3.0/24 -> 8.8.8.0/24, any src port, exact dst port 80 */
+	result = add_acl_specific_entry(pipe,
+					port_id,
+					status,
+					BE_IPV4_ADDR(1, 2, 3, 5),       /* src_ip */
+					BE_IPV4_ADDR(8, 8, 8, 6),       /* dst_ip */
+					DOCA_HTOBE16(1234),              /* src_port */
+					DOCA_HTOBE16(80),                /* dst_port */
+					DOCA_FLOW_L4_TYPE_EXT_TCP,       /* protocol */
+					DOCA_HTOBE32(0xffffff00),        /* src_ip_mask: /24 subnet */
+					DOCA_HTOBE32(0xffffff00),        /* dst_ip_mask: /24 subnet */
+					DOCA_HTOBE16(0xffff),            /* src_port_mask: any */
+					DOCA_HTOBE16(80),                /* dst_port_mask: exact (== dst_port) */
+					20,                              /* priority */
+					true,                            /* is_allow: ALLOW */
 					DOCA_FLOW_NO_WAIT,
 					&entries[i_entry++]);
 
@@ -521,11 +552,65 @@ static void print_acl_stats_wrapper(void *context)
 	print_acl_stats(ctx->nb_ports, ctx->num_of_entries, ctx->entries);
 }
 
+/*
+Run this sample on the DPU with:
+
+Sample Command Line from flow_acl_sample.yaml: ./build/doca_flow_acl -- -a aux/2,dv_flow_en=2 -a aux/3,dv_flow_en=2 -l 60"
+
+sudo ./binaries/doca_flow_acl -a 0000:03:00.0,dv_flow_en=2 -a 0000:03:00.1,dv_flow_en=2
+
+*
+ * Arguments after "--" are DPDK EAL parameters:
+ *   -a <device>,dv_flow_en=2   Select a device and enable HW flow steering.
+ *                               Two devices are needed (the sample runs in VNF mode with 2 ports).
+ *                               mlx5_core.eth.0 = physical uplink p0 (network-facing, has IP 199.48.128.30)
+ *                               mlx5_core.eth.1 = physical uplink p1
+ *
+ * Traffic flow (request path):
+ *
+ *   fortio client
+ *       |  fortio curl -k https://199.48.128.30:8443
+ *       v
+ *   [wire / network]
+ *       |
+ *       v
+ *   p0 (physical uplink port, IP 199.48.128.30)
+ *       |
+ *       v
+ *   eSwitch (hardware packet processor inside the DPU)
+ *       |
+ *       v
+ *   DOCA Flow pipeline:
+ *       Main pipe (matches IPv4) --> ACL pipe (checks rules: IP, port, protocol)
+ *           |                            |
+ *           |                         [ALLOW] --> DPU network stack (Linux kernel) --> Envoy (:8443)
+ *           |                            |
+ *           |                         [DROP]  --> packet discarded in HW, never reaches Linux
+ *           |                            |
+ *           |                      [NO MATCH] --> miss policy (ALLOW, forward to port)
+ *
+ * Response path: Envoy --> kernel --> eSwitch --> p0 --> wire --> fortio client
+ *
+ * Current behavior:
+ *   - Default policy is ALLOW: unmatched traffic passes through normally.
+ *   - A single DENY rule drops TCP traffic to dst port 8443 (Envoy).
+ *   - fortio curl -k https://199.48.128.30:8443 will be dropped in HW.
+ *   - All other traffic (SSH, HTTP on other ports, etc.) is unaffected.
+ *
+ * Notes:
+ *   - p0 is where external traffic arrives; p1 is needed by VNF mode but not
+ *     actively used for Envoy traffic.
+ *   - ACL rules are enforced in hardware. Dropped packets never reach the
+ *     DPU's Linux kernel or Envoy.
+ */
 doca_error_t flow_acl(int nb_queues)
 {
 	const int nb_ports = 2;
-	/* 1 entry for main pipe and 4 entries for ACL pipe */
-	const int num_of_entries = 5;
+	/*
+	 * 1 entry for main pipe + 1 ACL entry (drop TCP dst port 8443).
+	 * All other traffic hits the ACL pipe's miss policy (ALLOW/forward).
+	 */
+	const int num_of_entries = 2;
 	struct flow_resources resource = {.mode = DOCA_FLOW_RESOURCE_MODE_PORT, .nr_counters = num_of_entries};
 	uint32_t nr_shared_resources[SHARED_RESOURCE_NUM_VALUES] = {0};
 	struct doca_flow_port *ports[nb_ports];
@@ -569,8 +654,44 @@ doca_error_t flow_acl(int nb_queues)
 			return result;
 		}
 
-		result = add_acl_pipe_entries(acl_pipe, port_acl, &status, &entries[port_id][1]);
+		/*
+		 * Original sample had 4 ACL entries (add_acl_pipe_entries) with
+		 * various allow/deny rules for different IPs and port ranges.
+		 *
+		 * Replaced with a single DENY rule targeting Envoy's port:
+		 * - DROP all TCP traffic to destination port 8443
+		 * - Any source IP, any destination IP, any source port
+		 * - This blocks fortio requests (fortio curl -k https://199.48.128.30:8443)
+		 *   at the eSwitch in hardware, before they ever reach Envoy.
+		 *
+		 * The ACL pipe's miss policy is ALLOW (DOCA_FLOW_FWD_PORT), so all
+		 * traffic that does NOT match this deny rule passes through normally.
+		 * Only TCP to port 8443 is dropped.
+		 */
+		/* result = add_acl_pipe_entries(acl_pipe, port_acl, &status, &entries[port_id][1]);
 		if (result != DOCA_SUCCESS) {
+			stop_doca_flow_ports(nb_ports, ports);
+			doca_flow_destroy();
+			return result;
+		} */
+		result = add_acl_specific_entry(acl_pipe,
+						port_acl,
+						&status,
+						BE_IPV4_ADDR(0, 0, 0, 0),       /* src_ip: any */
+						BE_IPV4_ADDR(0, 0, 0, 0),       /* dst_ip: any */
+						DOCA_HTOBE16(0),                 /* src_port: any */
+						DOCA_HTOBE16(8443),              /* dst_port: 8443 (Envoy) */
+						DOCA_FLOW_L4_TYPE_EXT_TCP,       /* protocol: TCP */
+						DOCA_HTOBE32(0x0),               /* src_ip_mask: any */
+						DOCA_HTOBE32(0x0),               /* dst_ip_mask: any */
+						DOCA_HTOBE16(0x0),               /* src_port_mask: any */
+						DOCA_HTOBE16(8443),              /* dst_port_mask: exact (== dst_port) */
+						10,                              /* priority */
+						false,                           /* is_allow: DENY (drop) */
+						DOCA_FLOW_NO_WAIT,
+						&entries[port_id][1]);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to add ACL entry: %s", doca_error_get_descr(result));
 			stop_doca_flow_ports(nb_ports, ports);
 			doca_flow_destroy();
 			return result;
@@ -617,8 +738,8 @@ doca_error_t flow_acl(int nb_queues)
 			return DOCA_ERROR_BAD_STATE;
 		}
 	}
-
-	flow_wait_for_packets(20, print_acl_stats_wrapper, &ctx);
+	// Increase the timeout to 60seconds
+	flow_wait_for_packets(60, print_acl_stats_wrapper, &ctx);
 
 	result = stop_doca_flow_ports(nb_ports, ports);
 	doca_flow_destroy();
