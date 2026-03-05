@@ -102,84 +102,6 @@ destroy_pipe_cfg:
 }
 
 /*
- * Create DOCA Flow main pipe
- *
- * @port [in]: port of the pipe
- * @next_pipe [in]: acl pipe to forward the matched traffic
- * @pipe [out]: created pipe pointer
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise.
- */
-static doca_error_t create_main_pipe(struct doca_flow_port *port,
-				     struct doca_flow_pipe *next_pipe,
-				     struct doca_flow_pipe **pipe)
-{
-	struct doca_flow_pipe_cfg *pipe_cfg;
-	struct doca_flow_match match;
-	struct doca_flow_monitor monitor_counter;
-	struct doca_flow_fwd fwd;
-	doca_error_t result;
-
-	memset(&match, 0, sizeof(match));
-	memset(&monitor_counter, 0, sizeof(monitor_counter));
-	memset(&fwd, 0, sizeof(fwd));
-
-	match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
-
-	monitor_counter.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-
-	fwd.type = DOCA_FLOW_FWD_PIPE;
-	fwd.next_pipe = next_pipe;
-
-	result = doca_flow_pipe_cfg_create(&pipe_cfg, port);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to create doca_flow_pipe_cfg: %s", doca_error_get_descr(result));
-		return result;
-	}
-
-	result = set_flow_pipe_cfg(pipe_cfg, "MAIN_PIPE", DOCA_FLOW_PIPE_BASIC, true);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set doca_flow_pipe_cfg: %s", doca_error_get_descr(result));
-		goto destroy_pipe_cfg;
-	}
-
-	result = doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set doca_flow_pipe_cfg match: %s", doca_error_get_descr(result));
-		goto destroy_pipe_cfg;
-	}
-
-	result = doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor_counter);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to set doca_flow_pipe_cfg monitor: %s", doca_error_get_descr(result));
-		goto destroy_pipe_cfg;
-	}
-
-	result = doca_flow_pipe_create(pipe_cfg, &fwd, NULL, pipe);
-destroy_pipe_cfg:
-	doca_flow_pipe_cfg_destroy(pipe_cfg);
-	return result;
-}
-
-/*
- * Add DOCA Flow pipe entry to the main pipe that forwards ipv4 traffic to acl pipe
- *
- * @pipe [in]: pipe of the entry
- * @status [in]: user context for adding entry
- * @entry [out]: result of entry addition
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise.
- */
-static doca_error_t add_main_pipe_entry(struct doca_flow_pipe *pipe,
-					struct entries_status *status,
-					struct doca_flow_pipe_entry **entry)
-{
-	struct doca_flow_match match;
-
-	memset(&match, 0, sizeof(match));
-
-	return doca_flow_pipe_add_entry(0, pipe, &match, 0, NULL, NULL, NULL, DOCA_FLOW_NO_WAIT, status, entry);
-}
-
-/*
  * Add DOCA Flow ACL pipe that matched IPV4 addresses
  *
  * @port [in]: port of the pipe
@@ -214,10 +136,10 @@ doca_error_t create_acl_pipe(struct doca_flow_port *port, bool is_root, struct d
 
 	monitor_counter.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
 
-	/* Miss policy: allow all traffic by default (forward to the other port).
-	 * Only explicitly denied entries (e.g. TCP dst port 8443) will be dropped. */
-	fwd_miss.type = DOCA_FLOW_FWD_PORT;
-	fwd_miss.port_id = 0; /* overridden per-entry, but needed for pipe creation */
+	/* ACL pipes only support DOCA_FLOW_FWD_DROP as miss policy.
+	 * To allow all traffic by default, we add a low-priority catch-all
+	 * ALLOW entry in the ACL pipe (see flow_acl below). */
+	fwd_miss.type = DOCA_FLOW_FWD_DROP;
 
 	result = doca_flow_pipe_cfg_create(&pipe_cfg, port);
 	if (result != DOCA_SUCCESS) {
@@ -495,76 +417,10 @@ doca_error_t add_acl_pipe_entries(struct doca_flow_pipe *pipe,
 }
 
 /*
- * Print ACL statistics
- *
- * @nb_ports [in]: number of ports
- * @num_of_entries [in]: number of entries per port
- * @entries [in]: array of flow entries
- */
-static void print_acl_stats(int nb_ports, int num_of_entries, struct doca_flow_pipe_entry *entries[][2])
-{
-	doca_error_t result;
-	struct doca_flow_resource_query stats;
-	int port_id;
-
-	for (port_id = 0; port_id < nb_ports; port_id++) {
-		result = doca_flow_resource_query_entry(entries[port_id][0], &stats);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Port %d failed to query main pipe entry: %s",
-				     port_id,
-				     doca_error_get_descr(result));
-			return;
-		}
-		DOCA_LOG_INFO("Port %d, main pipe entry received %lu packets", port_id, stats.counter.total_pkts);
-
-		for (int acl_entry_id = 1; acl_entry_id < num_of_entries; acl_entry_id++) {
-			result = doca_flow_resource_query_entry(entries[port_id][acl_entry_id], &stats);
-			if (result != DOCA_SUCCESS) {
-				DOCA_LOG_ERR("Port %d failed to query ACL pipe entry %d: %s",
-					     port_id,
-					     acl_entry_id,
-					     doca_error_get_descr(result));
-				return;
-			}
-			DOCA_LOG_INFO("Port %d, ACL pipe entry %d received %lu packets",
-				      port_id,
-				      acl_entry_id,
-				      stats.counter.total_pkts);
-		}
-	}
-}
-
-/* Context structure for statistics printing */
-struct acl_stats_context {
-	int nb_ports;
-	int num_of_entries;
-	struct doca_flow_pipe_entry *(*entries)[2];
-};
-
-/*
- * Wrapper function for statistics printing compatible with flow_wait_for_packets
- *
- * @context [in]: acl_stats_context structure
- */
-static void print_acl_stats_wrapper(void *context)
-{
-	struct acl_stats_context *ctx = (struct acl_stats_context *)context;
-	print_acl_stats(ctx->nb_ports, ctx->num_of_entries, ctx->entries);
-}
-
-/*
 Run this sample on the DPU with:
 
-Sample Command Line from flow_acl_sample.yaml: ./build/doca_flow_acl -- -a aux/2,dv_flow_en=2 -a aux/3,dv_flow_en=2 -l 60"
+sudo ./binaries/doca_flow_acl -- -a pci/0000:03:00.0 -a pci/0000:03:00.1 -l 60
 
-sudo ./binaries/doca_flow_acl -a 0000:03:00.0,dv_flow_en=2 -a 0000:03:00.1,dv_flow_en=2
-
-*
- * Arguments after "--" are DPDK EAL parameters:
- *   -a <device>,dv_flow_en=2   Select a device and enable HW flow steering.
- *                               Two devices are needed (the sample runs in VNF mode with 2 ports).
- *                               mlx5_core.eth.0 = physical uplink p0 (network-facing, has IP 199.48.128.30)
- *                               mlx5_core.eth.1 = physical uplink p1
  *
  * Traffic flow (request path):
  *
@@ -587,15 +443,19 @@ sudo ./binaries/doca_flow_acl -a 0000:03:00.0,dv_flow_en=2 -a 0000:03:00.1,dv_fl
  *           |                            |
  *           |                         [DROP]  --> packet discarded in HW, never reaches Linux
  *           |                            |
- *           |                      [NO MATCH] --> miss policy (ALLOW, forward to port)
+ *           |                      [NO MATCH] --> miss policy (DROP)
  *
  * Response path: Envoy --> kernel --> eSwitch --> p0 --> wire --> fortio client
  *
  * Current behavior:
- *   - Default policy is ALLOW: unmatched traffic passes through normally.
- *   - A single DENY rule drops TCP traffic to dst port 8443 (Envoy).
- *   - fortio curl -k https://199.48.128.30:8443 will be dropped in HW.
- *   - All other traffic (SSH, HTTP on other ports, etc.) is unaffected.
+ *   - Two ACL rules are installed:
+ *     1. Priority 10 (high): DENY TCP to dst port 8443 --> DROP
+ *     2. Priority 1000 (low): ALLOW all TCP traffic --> FORWARD
+ *   - TCP to port 8443 matches rule 1 first and is dropped in HW.
+ *   - All other TCP traffic matches rule 2 and passes through.
+ *   - fortio curl -k https://199.48.128.30:8443 will be dropped.
+ *   - ACL miss policy is DROP (required by HW), but the catch-all
+ *     ALLOW rule ensures non-matching traffic is forwarded.
  *
  * Notes:
  *   - p0 is where external traffic arrives; p1 is needed by VNF mode but not
@@ -607,22 +467,23 @@ doca_error_t flow_acl(int nb_queues)
 {
 	const int nb_ports = 2;
 	/*
-	 * 1 entry for main pipe + 1 ACL entry (drop TCP dst port 8443).
-	 * All other traffic hits the ACL pipe's miss policy (ALLOW/forward).
+	 * Using a control pipe instead of ACL pipe.
+	 * ACL pipes require all entries to have the same mask pattern, which
+	 * prevents combining a deny-specific-port rule with a catch-all allow.
+	 * A control pipe supports different match patterns per entry.
+	 *
+	 * Control pipe entries are added synchronously — no
+	 * doca_flow_entries_process() call is needed.
 	 */
-	const int num_of_entries = 2;
-	struct flow_resources resource = {.mode = DOCA_FLOW_RESOURCE_MODE_PORT, .nr_counters = num_of_entries};
+	struct flow_resources resource = {.mode = DOCA_FLOW_RESOURCE_MODE_PORT, .nr_counters = 2};
 	uint32_t nr_shared_resources[SHARED_RESOURCE_NUM_VALUES] = {0};
 	struct doca_flow_port *ports[nb_ports];
 	uint32_t actions_mem_size[nb_ports];
-	struct doca_flow_pipe *acl_pipe;
-	struct doca_flow_pipe *main_pipe;
-	struct doca_flow_pipe *rx_pipe;
-	struct entries_status status;
-	struct doca_flow_pipe_entry *entries[nb_ports][num_of_entries];
-	struct acl_stats_context ctx = {.nb_ports = nb_ports, .num_of_entries = num_of_entries, .entries = entries};
+	struct doca_flow_pipe *ctrl_pipe;
+	struct doca_flow_match match;
+	struct doca_flow_fwd fwd;
 	doca_error_t result;
-	int port_id, port_acl;
+	int port_id;
 
 	result = init_doca_flow(nb_queues, "vnf,hws", &resource, nr_shared_resources);
 	if (result != DOCA_SUCCESS) {
@@ -630,7 +491,7 @@ doca_error_t flow_acl(int nb_queues)
 		return result;
 	}
 
-	ARRAY_INIT(actions_mem_size, ACL_ACTIONS_MEM_SIZE(num_of_entries));
+	ARRAY_INIT(actions_mem_size, ACL_ACTIONS_MEM_SIZE(2));
 	result = init_doca_flow_vnf_ports(nb_ports, ports, actions_mem_size, &resource);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init DOCA ports: %s", doca_error_get_descr(result));
@@ -639,107 +500,89 @@ doca_error_t flow_acl(int nb_queues)
 	}
 
 	for (port_id = 0; port_id < nb_ports; port_id++) {
-		memset(&status, 0, sizeof(status));
+		struct doca_flow_pipe_cfg *pipe_cfg;
 
-		if (domain == DOCA_FLOW_PIPE_DOMAIN_DEFAULT)
-			port_acl = port_id;
-		else // domain == DOCA_FLOW_PIPE_DOMAIN_EGRESS
-			port_acl = port_id ^ 1;
-
-		result = create_acl_pipe(ports[port_acl], false, &acl_pipe);
+		/* Create a control pipe (root pipe) on this port */
+		result = doca_flow_pipe_cfg_create(&pipe_cfg, ports[port_id]);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to create acl pipe: %s", doca_error_get_descr(result));
+			DOCA_LOG_ERR("Failed to create pipe cfg: %s", doca_error_get_descr(result));
+			stop_doca_flow_ports(nb_ports, ports);
+			doca_flow_destroy();
+			return result;
+		}
+		result = set_flow_pipe_cfg(pipe_cfg, "CONTROL_PIPE", DOCA_FLOW_PIPE_CONTROL, true);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to set pipe cfg: %s", doca_error_get_descr(result));
+			doca_flow_pipe_cfg_destroy(pipe_cfg);
+			stop_doca_flow_ports(nb_ports, ports);
+			doca_flow_destroy();
+			return result;
+		}
+		result = doca_flow_pipe_create(pipe_cfg, NULL, NULL, &ctrl_pipe);
+		doca_flow_pipe_cfg_destroy(pipe_cfg);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to create control pipe: %s", doca_error_get_descr(result));
 			stop_doca_flow_ports(nb_ports, ports);
 			doca_flow_destroy();
 			return result;
 		}
 
 		/*
-		 * Original sample had 4 ACL entries (add_acl_pipe_entries) with
-		 * various allow/deny rules for different IPs and port ranges.
-		 *
-		 * Replaced with a single DENY rule targeting Envoy's port:
-		 * - DROP all TCP traffic to destination port 8443
-		 * - Any source IP, any destination IP, any source port
-		 * - This blocks fortio requests (fortio curl -k https://199.48.128.30:8443)
-		 *   at the eSwitch in hardware, before they ever reach Envoy.
-		 *
-		 * The ACL pipe's miss policy is ALLOW (DOCA_FLOW_FWD_PORT), so all
-		 * traffic that does NOT match this deny rule passes through normally.
-		 * Only TCP to port 8443 is dropped.
+		 * Entry 1 (high priority): DROP TCP to dst port 8443.
+		 * Blocks fortio requests to Envoy in hardware.
 		 */
-		/* result = add_acl_pipe_entries(acl_pipe, port_acl, &status, &entries[port_id][1]);
+		memset(&match, 0, sizeof(match));
+		memset(&fwd, 0, sizeof(fwd));
+		match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+		match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
+		match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(8443);
+		fwd.type = DOCA_FLOW_FWD_DROP;
+
+		result = doca_flow_pipe_control_add_entry(0,
+							  1,           /* priority: 1 (highest) */
+							  ctrl_pipe,
+							  &match,
+							  NULL,        /* match_mask */
+							  NULL, NULL, NULL, NULL, NULL,
+							  &fwd,
+							  NULL,        /* status */
+							  NULL);       /* entry */
 		if (result != DOCA_SUCCESS) {
-			stop_doca_flow_ports(nb_ports, ports);
-			doca_flow_destroy();
-			return result;
-		} */
-		result = add_acl_specific_entry(acl_pipe,
-						port_acl,
-						&status,
-						BE_IPV4_ADDR(0, 0, 0, 0),       /* src_ip: any */
-						BE_IPV4_ADDR(0, 0, 0, 0),       /* dst_ip: any */
-						DOCA_HTOBE16(0),                 /* src_port: any */
-						DOCA_HTOBE16(8443),              /* dst_port: 8443 (Envoy) */
-						DOCA_FLOW_L4_TYPE_EXT_TCP,       /* protocol: TCP */
-						DOCA_HTOBE32(0x0),               /* src_ip_mask: any */
-						DOCA_HTOBE32(0x0),               /* dst_ip_mask: any */
-						DOCA_HTOBE16(0x0),               /* src_port_mask: any */
-						DOCA_HTOBE16(8443),              /* dst_port_mask: exact (== dst_port) */
-						10,                              /* priority */
-						false,                           /* is_allow: DENY (drop) */
-						DOCA_FLOW_NO_WAIT,
-						&entries[port_id][1]);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to add ACL entry: %s", doca_error_get_descr(result));
+			DOCA_LOG_ERR("Failed to add drop entry: %s", doca_error_get_descr(result));
 			stop_doca_flow_ports(nb_ports, ports);
 			doca_flow_destroy();
 			return result;
 		}
 
-		result = create_main_pipe(ports[port_id], acl_pipe, &main_pipe);
+		/*
+		 * Entry 2 (low priority): FORWARD all other IPv4 traffic.
+		 * Acts as a catch-all so non-8443 traffic passes through.
+		 */
+		memset(&match, 0, sizeof(match));
+		memset(&fwd, 0, sizeof(fwd));
+		match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+		fwd.type = DOCA_FLOW_FWD_PORT;
+		fwd.port_id = port_id ^ 1;
+
+		result = doca_flow_pipe_control_add_entry(0,
+							  2,           /* priority: 2 (lower) */
+							  ctrl_pipe,
+							  &match,
+							  NULL,
+							  NULL, NULL, NULL, NULL, NULL,
+							  &fwd,
+							  NULL,
+							  NULL);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to create main pipe: %s", doca_error_get_descr(result));
+			DOCA_LOG_ERR("Failed to add forward entry: %s", doca_error_get_descr(result));
 			stop_doca_flow_ports(nb_ports, ports);
 			doca_flow_destroy();
 			return result;
-		}
-
-		result = add_main_pipe_entry(main_pipe, &status, &entries[port_id][0]);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to add entry: %s", doca_error_get_descr(result));
-			stop_doca_flow_ports(nb_ports, ports);
-			doca_flow_destroy();
-			return result;
-		}
-
-		if (domain == DOCA_FLOW_PIPE_DOMAIN_EGRESS) {
-			result = create_rx_pipe(ports[port_id], port_id, &rx_pipe);
-			if (result != DOCA_SUCCESS) {
-				DOCA_LOG_ERR("Failed to create main pipe: %s", doca_error_get_descr(result));
-				stop_doca_flow_ports(nb_ports, ports);
-				doca_flow_destroy();
-				return result;
-			}
-		}
-
-		result = doca_flow_entries_process(ports[port_acl], 0, DEFAULT_TIMEOUT_US, num_of_entries);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to process entries: %s", doca_error_get_descr(result));
-			stop_doca_flow_ports(nb_ports, ports);
-			doca_flow_destroy();
-			return result;
-		}
-
-		if (status.nb_processed != num_of_entries || status.failure) {
-			DOCA_LOG_ERR("Failed to process entries");
-			stop_doca_flow_ports(nb_ports, ports);
-			doca_flow_destroy();
-			return DOCA_ERROR_BAD_STATE;
 		}
 	}
-	// Increase the timeout to 60seconds
-	flow_wait_for_packets(60, print_acl_stats_wrapper, &ctx);
+
+	DOCA_LOG_INFO("Control pipe entries installed — waiting for packets (60 s)...");
+	flow_wait_for_packets(60, NULL, NULL);
 
 	result = stop_doca_flow_ports(nb_ports, ports);
 	doca_flow_destroy();
