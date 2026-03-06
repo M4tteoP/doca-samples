@@ -52,7 +52,13 @@ int main(int argc, char **argv)
 	struct doca_log_backend *sdk_log;
 	int exit_status = EXIT_FAILURE;
 	struct application_dpdk_config dpdk_config = {
-		.port_config.nb_ports = 3,
+		/*
+		 * Changed from 3 to 1: since we replaced FWD_PORT (to representors)
+		 * with FWD_DROP, we only need the physical uplink port.
+		 * No representors (-r) are required on the command line.
+		 */
+		/* .port_config.nb_ports = 3, */
+		.port_config.nb_ports = 1,
 		.port_config.nb_queues = 1,
 		.port_config.switch_mode = 1,
 	};
@@ -92,7 +98,22 @@ int main(int argc, char **argv)
 	}
 
 	doca_argp_set_dpdk_program(flow_init_dpdk);
-	ctx.devs_ctx.default_dev_args = FLOW_SWITCH_DEV_ARGS;
+	/*
+	 * Changed fdb_def_rule_en from 0 to 1: keep the firmware's default FDB
+	 * miss rule active.  With fdb_def_rule_en=0, the default miss rule is
+	 * removed for BOTH ingress and egress.  Our root control pipe only
+	 * programs ingress rules (wire → eSwitch).  Without an egress rule,
+	 * kernel responses (SSH replies, TCP ACKs, …) cannot reach the wire,
+	 * so SSH dies even though ingress catch-all → kernel works.
+	 *
+	 * With fdb_def_rule_en=1 the default miss rule handles:
+	 *   - Egress: kernel → eSwitch → wire  (SSH responses get out)
+	 *   - Ingress fallback: if our root pipe somehow misses, the default
+	 *     rule forwards to the kernel anyway.
+	 * Our root control pipe DROP entry still takes priority for TCP 8443.
+	 */
+	/* ctx.devs_ctx.default_dev_args = FLOW_SWITCH_DEV_ARGS; */
+	ctx.devs_ctx.default_dev_args = "dv_flow_en=2,fdb_def_rule_en=1,vport_match=1,repr_matching_en=0,dv_xmeta_en=4";
 
 	result = doca_argp_start(argc, argv);
 	if (result != DOCA_SUCCESS) {

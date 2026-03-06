@@ -57,6 +57,8 @@ sample_srcs = [
 	'../../common.c',
 	# Common code for the DOCA library samples
 	'../flow_common.c',
+	# Flow switch common code (switch mode port init)
+	'../flow_switch_common.c',
 	# Common code for all DOCA applications
 	'../../../applications/common/dpdk_utils.c',
 ]

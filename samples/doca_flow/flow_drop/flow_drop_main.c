@@ -30,13 +30,14 @@
 #include <doca_log.h>
 
 #include <flow_common.h>
+#include <flow_switch_common.h>
 
 #include <dpdk_utils.h>
 
 DOCA_LOG_REGISTER(FLOW_DROP::MAIN);
 
 /* Sample's Logic */
-doca_error_t flow_drop(int nb_queues);
+doca_error_t flow_drop(int nb_queues, int nb_ports, struct flow_switch_ctx *ctx);
 
 /*
  * Sample main function
@@ -50,11 +51,13 @@ int main(int argc, char **argv)
 	doca_error_t result;
 	struct doca_log_backend *sdk_log;
 	int exit_status = EXIT_FAILURE;
-	struct flow_dev_ctx flow_dev_ctx = {};
 	struct application_dpdk_config dpdk_config = {
-		.port_config.nb_ports = 2,
+		/* Only 1 port needed — we use switch mode, not VNF port pairs */
+		.port_config.nb_ports = 1,
 		.port_config.nb_queues = 1,
+		.port_config.switch_mode = 1,
 	};
+	struct flow_switch_ctx ctx = {0};
 
 	/* Register a logger backend */
 	result = doca_log_backend_create_standard();
@@ -71,14 +74,14 @@ int main(int argc, char **argv)
 
 	DOCA_LOG_INFO("Starting the sample");
 
-	result = doca_argp_init(NULL, &flow_dev_ctx);
+	result = doca_argp_init(NULL, &ctx);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init ARGP resources: %s", doca_error_get_descr(result));
 		goto sample_exit;
 	}
-	result = register_flow_device_params(NULL);
+	result = register_doca_flow_switch_params();
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to register flow device params: %s", doca_error_get_descr(result));
+		DOCA_LOG_ERR("Failed to register flow param: %s", doca_error_get_descr(result));
 		goto argp_cleanup;
 	}
 
@@ -90,16 +93,23 @@ int main(int argc, char **argv)
 	}
 
 	doca_argp_set_dpdk_program(flow_init_dpdk);
+	/*
+	 * fdb_def_rule_en=0: remove default FDB miss rules (isolated mode).
+	 * We program all traffic paths explicitly:
+	 *   ingress catch-all → kernel, egress catch-all → wire.
+	 */
+	ctx.devs_ctx.default_dev_args = "dv_flow_en=2,fdb_def_rule_en=0,vport_match=1,repr_matching_en=0,dv_xmeta_en=4";
+
 	result = doca_argp_start(argc, argv);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to parse sample input: %s", doca_error_get_descr(result));
 		goto argp_cleanup;
 	}
 
-	result = init_doca_flow_devs(&flow_dev_ctx);
+	result = init_doca_flow_devs(&ctx.devs_ctx);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init flow devices: %s", doca_error_get_descr(result));
-		goto argp_cleanup;
+		goto dpdk_cleanup;
 	}
 
 	/* update queues and ports */
@@ -110,7 +120,7 @@ int main(int argc, char **argv)
 	}
 
 	/* run sample */
-	result = flow_drop(dpdk_config.port_config.nb_queues);
+	result = flow_drop(dpdk_config.port_config.nb_queues, dpdk_config.port_config.nb_ports, &ctx);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("flow_drop() encountered an error: %s", doca_error_get_descr(result));
 		goto dpdk_ports_queues_cleanup;
@@ -121,10 +131,11 @@ int main(int argc, char **argv)
 dpdk_ports_queues_cleanup:
 	dpdk_queues_and_ports_fini(&dpdk_config);
 dpdk_cleanup:
-	dpdk_fini_with_devs(dpdk_config.port_config.nb_ports);
+	dpdk_fini();
 argp_cleanup:
 	doca_argp_destroy();
 sample_exit:
+	destroy_doca_flow_devs(&ctx.devs_ctx);
 	if (exit_status == EXIT_SUCCESS)
 		DOCA_LOG_INFO("Sample finished successfully");
 	else
